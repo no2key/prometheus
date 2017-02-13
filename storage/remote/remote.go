@@ -19,16 +19,13 @@ import (
 	"github.com/prometheus/common/model"
 
 	"github.com/prometheus/prometheus/config"
-	"github.com/prometheus/prometheus/relabel"
 )
 
 // Storage allows queueing samples for remote writes.
 type Storage struct {
 	mtx            sync.RWMutex
 	externalLabels model.LabelSet
-	conf           config.RemoteWriteConfig
-
-	queue *StorageQueueManager
+	queues         []*StorageQueueManager
 }
 
 // ApplyConfig updates the state as the new config requires.
@@ -36,34 +33,36 @@ func (s *Storage) ApplyConfig(conf *config.Config) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
+	newQueues := []*StorageQueueManager{}
 	// TODO: we should only stop & recreate queues which have changes,
 	// as this can be quite disruptive.
-	var newQueue *StorageQueueManager
-
-	if conf.RemoteWriteConfig.URL != nil {
-		c, err := NewClient(conf.RemoteWriteConfig)
+	for i, conf := range conf.RemoteWriteConfigs {
+		c, err := NewClient(i, conf)
 		if err != nil {
 			return err
 		}
-		newQueue = NewStorageQueueManager(c, nil)
+		newQueues = append(newQueues, NewStorageQueueManager(StorageQueueManagerConfig{
+			Client:         c,
+			RelabelConfigs: conf.WriteRelabelConfigs,
+		}))
 	}
 
-	if s.queue != nil {
-		s.queue.Stop()
+	for _, q := range s.queues {
+		q.Stop()
 	}
-	s.queue = newQueue
-	s.conf = conf.RemoteWriteConfig
+
+	s.queues = newQueues
 	s.externalLabels = conf.GlobalConfig.ExternalLabels
-	if s.queue != nil {
-		s.queue.Start()
+	for _, q := range s.queues {
+		q.Start()
 	}
 	return nil
 }
 
 // Stop the background processing of the storage queues.
 func (s *Storage) Stop() {
-	if s.queue != nil {
-		s.queue.Stop()
+	for _, q := range s.queues {
+		q.Stop()
 	}
 }
 
@@ -72,26 +71,18 @@ func (s *Storage) Append(smpl *model.Sample) error {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 
-	if s.queue == nil {
-		return nil
-	}
+	for _, q := range s.queues {
+		var snew model.Sample
+		snew = *smpl
+		snew.Metric = smpl.Metric.Clone()
 
-	var snew model.Sample
-	snew = *smpl
-	snew.Metric = smpl.Metric.Clone()
-
-	for ln, lv := range s.externalLabels {
-		if _, ok := smpl.Metric[ln]; !ok {
-			snew.Metric[ln] = lv
+		for ln, lv := range s.externalLabels {
+			if _, ok := smpl.Metric[ln]; !ok {
+				snew.Metric[ln] = lv
+			}
 		}
+		q.Append(&snew)
 	}
-	snew.Metric = model.Metric(
-		relabel.Process(model.LabelSet(snew.Metric), s.conf.WriteRelabelConfigs...))
-
-	if snew.Metric == nil {
-		return nil
-	}
-	s.queue.Append(&snew)
 	return nil
 }
 

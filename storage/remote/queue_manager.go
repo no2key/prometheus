@@ -20,6 +20,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/relabel"
 )
 
 // String constants for instrumentation.
@@ -27,6 +29,11 @@ const (
 	namespace = "prometheus"
 	subsystem = "remote_storage"
 	queue     = "queue"
+
+	defaultQueueCapacity     = 100 * 1024 / 10
+	defaultShards            = 10
+	defaultMaxSamplesPerSend = 100
+	defaultBatchSendDeadline = 5 * time.Second
 )
 
 var (
@@ -105,25 +112,20 @@ type StorageClient interface {
 	Name() string
 }
 
+// StorageQueueManagerConfig configures a storage queue.
 type StorageQueueManagerConfig struct {
 	QueueCapacity     int           // Number of samples to buffer per shard before we start dropping them.
 	Shards            int           // Number of shards, i.e. amount of concurrency.
 	MaxSamplesPerSend int           // Maximum number of samples per send.
 	BatchSendDeadline time.Duration // Maximum time sample will wait in buffer.
-}
-
-var defaultConfig = StorageQueueManagerConfig{
-	QueueCapacity:     100 * 1024 / 10,
-	Shards:            10,
-	MaxSamplesPerSend: 100,
-	BatchSendDeadline: 5 * time.Second,
+	RelabelConfigs    []*config.RelabelConfig
+	Client            StorageClient
 }
 
 // StorageQueueManager manages a queue of samples to be sent to the Storage
 // indicated by the provided StorageClient.
 type StorageQueueManager struct {
 	cfg       StorageQueueManagerConfig
-	tsdb      StorageClient
 	shards    []chan *model.Sample
 	wg        sync.WaitGroup
 	done      chan struct{}
@@ -131,9 +133,18 @@ type StorageQueueManager struct {
 }
 
 // NewStorageQueueManager builds a new StorageQueueManager.
-func NewStorageQueueManager(tsdb StorageClient, cfg *StorageQueueManagerConfig) *StorageQueueManager {
-	if cfg == nil {
-		cfg = &defaultConfig
+func NewStorageQueueManager(cfg StorageQueueManagerConfig) *StorageQueueManager {
+	if cfg.QueueCapacity == 0 {
+		cfg.QueueCapacity = defaultQueueCapacity
+	}
+	if cfg.Shards == 0 {
+		cfg.Shards = defaultShards
+	}
+	if cfg.MaxSamplesPerSend == 0 {
+		cfg.MaxSamplesPerSend = defaultMaxSamplesPerSend
+	}
+	if cfg.BatchSendDeadline == 0 {
+		cfg.BatchSendDeadline = defaultBatchSendDeadline
 	}
 
 	shards := make([]chan *model.Sample, cfg.Shards)
@@ -142,11 +153,10 @@ func NewStorageQueueManager(tsdb StorageClient, cfg *StorageQueueManagerConfig) 
 	}
 
 	t := &StorageQueueManager{
-		cfg:       *cfg,
-		tsdb:      tsdb,
+		cfg:       cfg,
 		shards:    shards,
 		done:      make(chan struct{}),
-		queueName: tsdb.Name(),
+		queueName: cfg.Client.Name(),
 	}
 
 	queueCapacity.WithLabelValues(t.queueName).Set(float64(t.cfg.QueueCapacity))
@@ -158,6 +168,13 @@ func NewStorageQueueManager(tsdb StorageClient, cfg *StorageQueueManagerConfig) 
 // sample on the floor if the queue is full.
 // Always returns nil.
 func (t *StorageQueueManager) Append(s *model.Sample) error {
+	s.Metric = model.Metric(
+		relabel.Process(model.LabelSet(s.Metric), t.cfg.RelabelConfigs...))
+
+	if s.Metric == nil {
+		return nil
+	}
+
 	fp := s.Metric.FastFingerprint()
 	shard := uint64(fp) % uint64(t.cfg.Shards)
 
@@ -239,7 +256,7 @@ func (t *StorageQueueManager) sendSamples(s model.Samples) {
 	// sample isn't sent correctly the first time, it's simply dropped on the
 	// floor.
 	begin := time.Now()
-	err := t.tsdb.Store(s)
+	err := t.cfg.Client.Store(s)
 	duration := time.Since(begin).Seconds()
 
 	if err != nil {
